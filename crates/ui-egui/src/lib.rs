@@ -971,6 +971,32 @@ impl FilmcraftApp {
                 }
                 r
             }
+            "file.exportFrame" | "source.exportFrame" => {
+                if let Some(command) = filmcraft_engine::find_command(id) {
+                    (command.enabled)(&self.session)?;
+                }
+                let source = id == "source.exportFrame";
+                let format = params.get("format").and_then(Value::as_str).unwrap_or("png").to_ascii_lowercase();
+                let ext = match format.as_str() {
+                    "png" | "bmp" | "tiff" => format.as_str(),
+                    "tif" => "tiff",
+                    _ => return Err("format must be png, tiff or bmp".into()),
+                };
+                let suggested = filmcraft_engine::keyboard::suggested_frame_path(&self.session, source, ext).map_err(|e| e.to_string())?;
+                let name = std::path::Path::new(&suggested).file_name().map(|p| p.to_string_lossy().to_string()).unwrap_or(suggested);
+                let Some(picker) = self.hooks.pick_save_as.as_mut() else {
+                    return Err("no save dialog available: run Export Frame with a path".into());
+                };
+                let Some(path) = picker("Still image (PNG, TIFF, BMP)", &["png", "tif", "tiff", "bmp"], &name) else { return Ok(Value::Null) };
+                let mut args = params.clone();
+                if args.get("format").is_none() {
+                    if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
+                        args["format"] = json!(ext.to_ascii_lowercase());
+                    }
+                }
+                args["path"] = json!(path);
+                self.session.execute(id, args).map_err(|e| e.to_string())
+            }
             "file.saveAs" | "file.save" | "file.saveCopy" => {
                 let suggested =
                     if id == "file.saveCopy" { format!("{} copy.fcproj", self.session.project.name) } else { format!("{}.fcproj", self.session.project.name) };
@@ -1064,6 +1090,13 @@ impl FilmcraftApp {
             // Select All / Deselect All act on the Project panel's items when it has focus (#168).
             if self.ui.focused == PanelKind::Project && matches!(id.as_str(), "edit.selectAll" | "edit.deselectAll") {
                 id = id.replacen("edit.", "project.", 1);
+            }
+            if self.ui.focused == PanelKind::Source {
+                match id.as_str() {
+                    "file.exportFrame" => id = "source.exportFrame".into(),
+                    "markers.add" => id = "source.addMarker".into(),
+                    _ => {}
+                }
             }
             // Mark In/Out in the Source monitor when it has focus.
             let params = if self.ui.focused == PanelKind::Source

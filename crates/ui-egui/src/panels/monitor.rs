@@ -504,6 +504,7 @@ fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which)
         icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(sz, sz)), icon, col);
         if resp.clicked() {
             let r = match cmd {
+                "markers.add" if src => crate::menus::invoke(app, &ctx, "source.addMarker", json!({})),
                 "src.markIn" => app.session.execute("markers.markIn", json!({"target": "source"})).map_err(|e| e.to_string()),
                 "src.markOut" => app.session.execute("markers.markOut", json!({"target": "source"})).map_err(|e| e.to_string()),
                 "src.goIn" | "src.goOut" | "src.stepBack" | "src.stepFwd" => {
@@ -511,10 +512,7 @@ fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which)
                     Ok(serde_json::Value::Null)
                 }
                 "src.play" => Ok(serde_json::Value::Null),
-                "exportFrame" => {
-                    app.ui.status = "Export Frame: use Export mode (M6)".into();
-                    Ok(serde_json::Value::Null)
-                }
+                "exportFrame" => crate::menus::invoke(app, &ctx, if src { "source.exportFrame" } else { "file.exportFrame" }, json!({})),
                 c => crate::menus::invoke(app, &ctx, c, json!({})),
             };
             if let Err(e) = r {
