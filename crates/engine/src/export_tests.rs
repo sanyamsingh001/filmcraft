@@ -103,6 +103,22 @@ fn stepped_jobs_publish_cancellation_and_io_failure_distinctly() {
         assert_eq!(result["finished"], true);
         assert_eq!(result["result"], json!({"error": error}));
         assert!(!Path::new(&path).exists());
+        assert_eq!(job.progress.terminal_cancellation(), Some(cancel));
+        assert!(s.log.entries.is_empty(), "the first terminal Event must still be pending");
+        // White-box discriminator after terminal publication, not a public uncancel operation:
+        // the opposite request must not replace the producer's known terminal cause.
+        job.progress.cancel.store(!cancel, Ordering::Relaxed);
+        let events = s.execute("events.list", json!({})).unwrap();
+        let entries = events["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let message = if cancel { format!("Cancelled: {}", job.label) } else { format!("Failed: {}: {error}", job.label) };
+        assert_eq!(entries[1]["source"], "job");
+        assert_eq!(entries[1]["level"], if cancel { "warning" } else { "error" });
+        assert_eq!(entries[1]["message"], message);
+        assert!(entries.iter().all(|entry| entry["count"] == 1));
+        assert_eq!(job.to_json()["result"], result["result"], "classification preserves the original producer result");
+        s.poll_persistence();
+        assert_eq!(s.execute("events.list", json!({})).unwrap(), events, "terminal Events remain once-only");
     }
     assert_eq!(std::fs::read(blocker).unwrap(), b"regular file");
 }
