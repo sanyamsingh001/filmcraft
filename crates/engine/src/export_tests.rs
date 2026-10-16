@@ -947,3 +947,113 @@ fn caption_vtt_sidecar_retains_cues_distinct_at_millisecond_precision() {
         &[(Tick::ZERO, Tick(101_606_400_000), "Surviving cue"), (Tick(254_016_000_000), Tick(254_270_016_000), "Clipped residue")],
     );
 }
+
+// These command-only fixtures deliberately resolve an explicit custom range without rendering.
+// Empty sequence contents do not constrain a caller-supplied positive custom range.
+fn export_target_timebase_fixture(target_fps: f64, target_drop_frame: bool, active_fps: f64) -> (Session, u64, u64) {
+    let mut s = Session::default();
+    let target =
+        s.execute("file.newSequence", json!({"name":"Export target", "fps":target_fps, "width":16, "height":16, "video":0, "audio":0})).unwrap()["sequence"]
+            .as_u64()
+            .unwrap();
+    s.execute("sequence.settings", json!({"dropFrame":target_drop_frame})).unwrap();
+    let active =
+        s.execute("file.newSequence", json!({"name":"Active sequence", "fps":active_fps, "width":16, "height":16, "video":0, "audio":0})).unwrap()["sequence"]
+            .as_u64()
+            .unwrap();
+    s.execute("sequence.settings", json!({"dropFrame":false})).unwrap();
+    assert_ne!(target, active);
+    assert_eq!(s.state.active_sequence.unwrap().0, active);
+    (s, target, active)
+}
+
+fn resolve_target_range_without_editing(s: &mut Session, params: Value) -> Value {
+    let project = serde_json::to_value(&s.project).unwrap();
+    let state = serde_json::to_value(&s.state).unwrap();
+    let history = s.execute("history.list", json!({})).unwrap();
+    let active = s.state.active_sequence;
+    let resolved = s.execute("export.resolve", params).unwrap();
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), project);
+    assert_eq!(serde_json::to_value(&s.state).unwrap(), state);
+    assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+    assert_eq!(s.state.active_sequence, active, "resolving a target must not activate it");
+    resolved
+}
+
+fn assert_resolved_target_time(resolved: &Value, start: i64, duration: i64) {
+    assert_eq!(resolved["range"]["start"], start, "absolute start must use the target timebase");
+    assert_eq!(resolved["range"]["duration"], duration, "duration must use the target timebase");
+}
+
+#[test]
+fn custom_export_frames_use_the_target_sequence_rate() {
+    let (mut s, target, _) = export_target_timebase_fixture(25.0, false, 50.0);
+    let resolved =
+        resolve_target_range_without_editing(&mut s, json!({"sequence":target, "preset":"PNG Sequence", "range":"custom", "startFrame":25, "endFrame":50}));
+    assert!(resolved["source"].as_str().unwrap().contains(", 25 fps,"));
+    assert_resolved_target_time(&resolved, 254_016_000_000, 254_016_000_000);
+    assert_eq!(resolved["frames"], 25);
+}
+
+#[test]
+fn custom_export_absolute_timecodes_use_the_target_sequence_rate() {
+    let (mut s, target, _) = export_target_timebase_fixture(25.0, false, 50.0);
+    let resolved = resolve_target_range_without_editing(
+        &mut s,
+        json!({"sequence":target, "preset":"PNG Sequence", "range":"custom",
+               "startTimecode":"00:00:00:10", "endTimecode":"00:00:01:10"}),
+    );
+    // At 25 fps these labels are 0.4 s and 1.4 s. The duration alone cannot detect this bug.
+    assert_resolved_target_time(&resolved, 101_606_400_000, 254_016_000_000);
+    assert_eq!(resolved["frames"], 25);
+}
+
+#[test]
+fn custom_export_absolute_timecodes_use_the_target_drop_frame_setting() {
+    let (mut s, target, _) = export_target_timebase_fixture(30_000.0 / 1001.0, true, 30_000.0 / 1001.0);
+    let target_id = filmcraft_project::ItemId(target);
+    assert_eq!(s.project.sequence(target_id).unwrap().settings.frame_rate, filmcraft_time::FrameRate::FPS_29_97);
+    assert!(s.project.sequence(target_id).unwrap().settings.drop_frame);
+    assert!(!s.active_sequence().unwrap().settings.drop_frame);
+    let resolved = resolve_target_range_without_editing(
+        &mut s,
+        json!({"sequence":target, "preset":"PNG Sequence", "range":"custom",
+               "startTimecode":"00;01;00;02", "endTimecode":"00;01;01;02"}),
+    );
+    // DF labels are frames 1800..1830. Each 30000/1001 frame is exactly 8,475,667,200 ticks.
+    // Semicolons are accepted separators; the sequence setting supplies the DF interpretation.
+    assert_resolved_target_time(&resolved, 15_256_200_960_000, 254_270_016_000);
+    assert_eq!(resolved["frames"], 30);
+}
+
+#[test]
+fn custom_export_seconds_are_independent_of_the_active_sequence_rate() {
+    let (mut s, target, _) = export_target_timebase_fixture(25.0, false, 50.0);
+    let resolved =
+        resolve_target_range_without_editing(&mut s, json!({"sequence":target, "preset":"PNG Sequence", "range":"custom", "startSeconds":1, "endSeconds":2}));
+    assert_resolved_target_time(&resolved, 254_016_000_000, 254_016_000_000);
+    assert_eq!(resolved["frames"], 25);
+}
+
+#[test]
+fn custom_export_frames_keep_the_active_target_behavior() {
+    let (mut s, _, active) = export_target_timebase_fixture(25.0, false, 50.0);
+    let resolved =
+        resolve_target_range_without_editing(&mut s, json!({"sequence":active, "preset":"PNG Sequence", "range":"custom", "startFrame":50, "endFrame":100}));
+    assert!(resolved["source"].as_str().unwrap().contains(", 50 fps,"));
+    assert_resolved_target_time(&resolved, 254_016_000_000, 254_016_000_000);
+    assert_eq!(resolved["frames"], 50);
+}
+
+#[test]
+fn custom_export_input_frames_do_not_use_the_output_rate_override() {
+    let (mut s, target, _) = export_target_timebase_fixture(25.0, false, 50.0);
+    let resolved = resolve_target_range_without_editing(
+        &mut s,
+        json!({"sequence":target, "preset":"PNG Sequence", "fps":10, "range":"custom", "startFrame":25, "endFrame":50}),
+    );
+    assert_eq!(resolved["output"]["fps"], "10");
+    assert!(resolved["source"].as_str().unwrap().contains(", 25 fps,"));
+    assert_resolved_target_time(&resolved, 254_016_000_000, 254_016_000_000);
+    assert_eq!(resolved["frames"], 10, "output sampling changes independently from input range units");
+}
