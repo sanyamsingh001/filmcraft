@@ -1018,3 +1018,210 @@ mod progress_export_io_errors {
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 }
+
+mod progress_keyboard_diagnostics {
+    use super::*;
+    use egui::{Event, Id, Key, Modifiers, Shape};
+    use filmcraft_engine::Job;
+    use filmcraft_ui_egui::dock::{DockNode, PanelKind};
+    use std::sync::atomic::Ordering;
+
+    fn job(id: u64, label: &str, error: Option<&str>) -> Job {
+        let job = Job {
+            id,
+            label: label.into(),
+            progress: Arc::new(Default::default()),
+            result: Arc::new(std::sync::Mutex::new(error.map(|error| Err(error.to_owned())))),
+        };
+        job.progress.total.store(10, Ordering::Relaxed);
+        job.progress.done.store(if error.is_some() { 10 } else { 4 }, Ordering::Relaxed);
+        job.progress.finished.store(error.is_some(), Ordering::Relaxed);
+        *job.progress.error.lock().unwrap() = error.map(str::to_owned);
+        job
+    }
+
+    fn tab(d: &mut Driver, modifiers: Modifiers) {
+        for pressed in [true, false] {
+            d.harness.event(Event::PointerGone);
+            d.harness.event(Event::Key { key: Key::Tab, physical_key: None, pressed, repeat: false, modifiers });
+            d.frames(1);
+        }
+        d.frames(2);
+        assert!(d.harness.state().ui_error.is_none());
+        assert!(d.harness.ctx.input(|input| input.pointer.hover_pos().is_none()));
+    }
+
+    fn painted(d: &Driver, predicate: impl Fn(&Shape) -> bool) -> bool {
+        fn any(shape: &Shape, predicate: &dyn Fn(&Shape) -> bool) -> bool {
+            predicate(shape)
+                || match shape {
+                    Shape::Vec(shapes) => shapes.iter().any(|shape| any(shape, predicate)),
+                    _ => false,
+                }
+        }
+        d.harness.output().shapes.iter().any(|shape| any(&shape.shape, &predicate))
+    }
+
+    fn full_detail(d: &Driver, text: &str) -> bool {
+        painted(d, |shape| matches!(shape, Shape::Text(shape) if shape.galley.text() == text))
+    }
+
+    fn assert_focused_detail(d: &Driver, id: Id, text: &str) {
+        assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(id));
+        let response = d.harness.ctx.read_response(id).unwrap();
+        assert!(response.has_focus());
+        assert!(!response.hovered());
+        assert!(full_detail(d, text), "keyboard focus must paint the complete diagnostic");
+        assert!(
+            painted(d, |shape| matches!(shape, Shape::Rect(rect)
+                if rect.rect == response.rect.shrink(2.0)
+                    && rect.stroke.color == d.harness.state().tokens.focus
+                    && rect.stroke.width == 1.5)),
+            "the completed row needs a visible focus outline"
+        );
+    }
+
+    fn document_state(d: &mut Driver) -> Value {
+        let app = d.app();
+        let history = app.session.execute("history.list", json!({})).unwrap();
+        json!({
+            "project": app.session.project.as_ref(),
+            "editor": app.session.state,
+            "history": history,
+            "revision": app.session.revision,
+            "savedRevision": app.session.saved_revision,
+            "path": app.session.path,
+            "playing": app.playback.playing,
+        })
+    }
+
+    fn job_state(jobs: &[Job]) -> Value {
+        json!(
+            jobs.iter()
+                .map(|job| {
+                    let mut public = job.to_json();
+                    // ETA is a time-dependent observation, not a job mutation.
+                    public.as_object_mut().unwrap().remove("etaSeconds");
+                    json!({
+                        "public": public,
+                        "cancel": job.progress.cancel.load(Ordering::Relaxed),
+                        "cancelled": job.progress.cancelled.load(Ordering::Relaxed),
+                        "producerFinished": job.progress.finished.load(Ordering::Relaxed),
+                        "error": job.progress.error.lock().unwrap().clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[test]
+    fn completed_progress_diagnostics_support_keyboard_focus_without_hover() {
+        for screen_reader in [false, true] {
+            let error = format!("I/O: /exports/{}final.wav: permission denied\nComplete diagnostic tail: Ω", "long-component/".repeat(18),);
+            let jobs = vec![
+                job(8801, "Older completed control", Some("older diagnostic")),
+                job(8802, "Running control", None),
+                job(8803, "Export final.wav", Some(&error)),
+            ];
+            let older = Id::new(("progress-job", 8801_u64));
+            let running_row = Id::new(("progress-job", 8802_u64));
+            let cancel = Id::new(("progress-cancel", 8802_u64));
+            let failed = Id::new(("progress-job", 8803_u64));
+            let inserted = Id::new(("progress-job", 8804_u64));
+            let text = format!("Export final.wav: Failed: {error}");
+
+            let mut d = Driver::demo();
+            {
+                let app = d.app();
+                app.ui.show_header = false;
+                app.ui.show_status_bar = false;
+                app.ui.dock = DockNode::Tabs { panels: vec![PanelKind::Progress], active: 0 };
+                app.ui.focused = PanelKind::Progress;
+                app.ui.panels.progress.show_finished = true;
+                app.session.prefs.general.show_tool_tips = false;
+                app.session.jobs = jobs.clone();
+            }
+            d.harness.ctx.memory_mut(|memory| memory.options.screen_reader = screen_reader);
+            d.harness.event(Event::PointerGone);
+            d.frames(4);
+
+            // Preconditions already supported by the old hover-only row.
+            assert_eq!(d.label("progress.job.8803"), text);
+            assert!(d.has("progress.cancel.8802"));
+            assert!(!d.has("progress.cancel.8803"));
+            let before_document = document_state(&mut d);
+            let before_jobs = job_state(&jobs);
+
+            for _ in 0..128 {
+                tab(&mut d, Modifiers::NONE);
+                if d.harness.ctx.memory(|memory| memory.focused()) == Some(failed) {
+                    break;
+                }
+            }
+            assert_eq!(
+                d.harness.ctx.memory(|memory| memory.focused()),
+                Some(failed),
+                "Tab must reach the completed diagnostic row; screen_reader={screen_reader}",
+            );
+            assert_focused_detail(&d, failed, &text);
+
+            // Inserting at the front of the reversed display must preserve identity.
+            d.app().session.jobs.push(job(8804, "Inserted completed control", Some("inserted diagnostic")));
+            d.frames(3);
+            assert_focused_detail(&d, failed, &text);
+            d.app().session.jobs.retain(|job| job.id != 8804);
+            d.frames(3);
+            assert_focused_detail(&d, failed, &text);
+
+            // No tooltip child or running-row focus stop may intervene.
+            tab(&mut d, Modifiers::NONE);
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            assert!(!full_detail(&d, &text));
+            // With the tooltip gone, this name must belong to the row's semantics.
+            assert!(d.harness.query_by_label(&text).is_some());
+
+            tab(&mut d, Modifiers::NONE);
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(older));
+            tab(&mut d, Modifiers::SHIFT);
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            tab(&mut d, Modifiers::SHIFT);
+            assert_focused_detail(&d, failed, &text);
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&jobs), before_jobs);
+
+            // Do not click the checkbox: that would move focus before hiding the row.
+            d.app().ui.panels.progress.show_finished = false;
+            d.frames(3);
+            let focus = d.harness.ctx.memory(|memory| memory.focused());
+            assert!(![failed, older, inserted, running_row].into_iter().any(|id| focus == Some(id)));
+            assert!(!d.has("progress.job.8803"));
+            assert!(!d.has("progress.job.8801"));
+            assert!(d.harness.query_by_label(&text).is_none());
+            assert!(!full_detail(&d, &text));
+
+            for _ in 0..128 {
+                tab(&mut d, Modifiers::NONE);
+                let focus = d.harness.ctx.memory(|memory| memory.focused());
+                assert!(![failed, older, inserted, running_row].into_iter().any(|id| focus == Some(id)));
+                if focus == Some(cancel) {
+                    break;
+                }
+            }
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            assert_eq!(job_state(&d.app().session.jobs), before_jobs);
+
+            // Removing the final running row must also release its existing control.
+            d.app().session.jobs.clear();
+            d.frames(3);
+            let focus = d.harness.ctx.memory(|memory| memory.focused());
+            assert!(![failed, older, inserted, running_row, cancel].into_iter().any(|id| focus == Some(id)));
+            assert!(d.ids("progress.job.").is_empty());
+            assert!(d.ids("progress.cancel.").is_empty());
+            assert!(d.harness.query_by_label("No background jobs.").is_some());
+            assert!(d.harness.query_by_label(&text).is_none());
+            assert!(!full_detail(&d, &text));
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&jobs), before_jobs);
+        }
+    }
+}
