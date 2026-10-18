@@ -1224,4 +1224,183 @@ mod progress_keyboard_diagnostics {
             assert_eq!(job_state(&jobs), before_jobs);
         }
     }
+
+    #[test]
+    fn completed_progress_tooltip_respects_disabled_hover_after_keyboard_focus() {
+        // The enabled case controls for real hover; the disabled case is the regression.
+        for show_tool_tips in [true, false] {
+            let error = "I/O: /exports/hover-control.wav: permission denied\nFull hover diagnostic tail: Ω";
+            let jobs = vec![job(8811, "Running hover control", None), job(8812, "Export hover control", Some(error))];
+            let failed = Id::new(("progress-job", 8812_u64));
+            let cancel = Id::new(("progress-cancel", 8811_u64));
+            let text = format!("Export hover control: Failed: {error}");
+
+            let mut d = Driver::demo();
+            {
+                let app = d.app();
+                app.ui.show_header = false;
+                app.ui.show_status_bar = false;
+                app.ui.dock = DockNode::Tabs { panels: vec![PanelKind::Progress], active: 0 };
+                app.ui.focused = PanelKind::Progress;
+                app.ui.panels.progress.show_finished = true;
+                app.session.prefs.general.show_tool_tips = show_tool_tips;
+                app.session.jobs = jobs.clone();
+            }
+            d.harness.ctx.memory_mut(|memory| memory.options.screen_reader = false);
+            d.harness.event(Event::PointerGone);
+            d.frames(4);
+            assert_eq!(d.label("progress.job.8812"), text);
+            assert!(d.has("progress.cancel.8811"));
+            assert!(!d.has("progress.cancel.8812"));
+            let before_document = document_state(&mut d);
+            let before_jobs = job_state(&jobs);
+
+            for _ in 0..128 {
+                tab(&mut d, Modifiers::NONE);
+                if d.harness.ctx.memory(|memory| memory.focused()) == Some(failed) {
+                    break;
+                }
+            }
+            assert_focused_detail(&d, failed, &text);
+
+            // Keep a real pointer over the registered row as keyboard focus leaves.
+            let row = d.harness.ctx.read_response(failed).unwrap();
+            assert!(row.rect.width() > 0.0 && row.rect.height() > 0.0);
+            let pointer = row.rect.center();
+            d.harness.event(Event::PointerMoved(pointer));
+            d.frames(3);
+            let row = d.harness.ctx.read_response(failed).unwrap();
+            assert!(row.has_focus());
+            assert!(row.hovered());
+            assert!(full_detail(&d, &text));
+
+            // Do not use tab(): its PointerGone would hide the defect.
+            for pressed in [true, false] {
+                d.harness.event(Event::Key { key: Key::Tab, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
+                d.frames(1);
+            }
+            d.frames(2);
+            assert!(d.harness.state().ui_error.is_none());
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            let row = d.harness.ctx.read_response(failed).unwrap();
+            assert!(!row.has_focus());
+            assert!(row.hovered(), "the completed row must still be hovered after Tab");
+            assert_eq!(d.harness.ctx.input(|input| input.pointer.hover_pos()), Some(pointer));
+            assert_eq!(d.app().session.prefs.general.show_tool_tips, show_tool_tips);
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&d.app().session.jobs), before_jobs);
+            assert_eq!(job_state(&jobs), before_jobs);
+
+            if show_tool_tips {
+                assert!(full_detail(&d, &text), "enabled hover must preserve the diagnostic after keyboard focus leaves");
+            } else {
+                assert!(!full_detail(&d, &text), "disabled automatic detail must disappear after keyboard focus leaves the hovered completed row");
+            }
+
+            // Cleanup is reached only if the preference-specific assertion passed.
+            d.harness.event(Event::PointerGone);
+            d.frames(3);
+            assert!(d.harness.state().ui_error.is_none());
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            assert!(!d.harness.ctx.read_response(failed).unwrap().hovered());
+            assert!(!full_detail(&d, &text));
+            assert!(d.harness.query_by_label(&text).is_some());
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&jobs), before_jobs);
+        }
+    }
+
+    #[test]
+    fn completed_progress_tooltip_respects_disabled_hover_on_cancel_after_keyboard_focus() {
+        for show_tool_tips in [true, false] {
+            let error = "I/O: /exports/grace-control.wav: permission denied\nFocused diagnostic before Cancel hover: Ω";
+            let jobs = vec![job(8821, "Running grace control", None), job(8822, "Export grace control", Some(error))];
+            let failed = Id::new(("progress-job", 8822_u64));
+            let cancel = Id::new(("progress-cancel", 8821_u64));
+            let text = format!("Export grace control: Failed: {error}");
+
+            // The ordinary Driver advances 0.25 s per frame, beyond egui's 0.2 s grace.
+            let mut session = Session::default();
+            session.execute("file.openDemoProject", json!({})).expect("demo project");
+            let (tx, rx) = channel();
+            let app = FilmcraftApp::new(session).with_control(rx);
+            let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| app);
+            let mut d = Driver { harness, tx, snapshots: None };
+            d.frames(4);
+            {
+                let app = d.app();
+                app.ui.show_header = false;
+                app.ui.show_status_bar = false;
+                app.ui.dock = DockNode::Tabs { panels: vec![PanelKind::Progress], active: 0 };
+                app.ui.focused = PanelKind::Progress;
+                app.ui.panels.progress.show_finished = true;
+                app.session.prefs.general.show_tool_tips = show_tool_tips;
+                app.session.jobs = jobs.clone();
+            }
+            d.harness.ctx.memory_mut(|memory| memory.options.screen_reader = false);
+            d.harness.event(Event::PointerGone);
+            d.frames(4);
+            assert_eq!(d.label("progress.job.8822"), text);
+            assert!(d.has("progress.cancel.8821"));
+            assert!(!d.has("progress.cancel.8822"));
+            let before_document = document_state(&mut d);
+            let before_jobs = job_state(&jobs);
+
+            for _ in 0..128 {
+                tab(&mut d, Modifiers::NONE);
+                if d.harness.ctx.memory(|memory| memory.focused()) == Some(failed) {
+                    break;
+                }
+            }
+            assert_focused_detail(&d, failed, &text);
+
+            let control = d.harness.ctx.read_response(cancel).unwrap();
+            assert!(control.rect.width() > 0.0 && control.rect.height() > 0.0);
+            let pointer = control.rect.center();
+            d.harness.event(Event::PointerMoved(pointer));
+            d.frames(1);
+            assert!(d.harness.ctx.read_response(cancel).unwrap().hovered());
+            assert!(d.harness.ctx.read_response(failed).unwrap().has_focus());
+            assert!(full_detail(&d, &text));
+            let last_focused_detail_time = d.harness.ctx.input(|input| input.time);
+
+            // Keep the pointer over Cancel while real Tab changes keyboard focus.
+            for pressed in [true, false] {
+                d.harness.event(Event::Key { key: Key::Tab, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
+                d.frames(1);
+            }
+            d.frames(2);
+            let elapsed = d.harness.ctx.input(|input| input.time) - last_focused_detail_time;
+            assert!(elapsed > 0.0 && elapsed < 0.2, "the observed transition must stay within the default tooltip grace: {elapsed}");
+            assert!(d.harness.state().ui_error.is_none());
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            let control = d.harness.ctx.read_response(cancel).unwrap();
+            assert!(control.has_focus());
+            assert!(control.hovered());
+            assert!(!d.harness.ctx.read_response(failed).unwrap().has_focus());
+            assert_eq!(d.harness.ctx.input(|input| input.pointer.hover_pos()), Some(pointer));
+            assert!(!full_detail(&d, &text), "the previous completed-row tooltip must be gone");
+            assert_eq!(d.app().session.prefs.general.show_tool_tips, show_tool_tips);
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&d.app().session.jobs), before_jobs);
+            assert_eq!(job_state(&jobs), before_jobs);
+
+            if show_tool_tips {
+                assert!(full_detail(&d, "Cancel"), "enabled hover must show the Cancel tooltip after the focused diagnostic");
+            } else {
+                assert!(!full_detail(&d, "Cancel"), "disabled automatic Cancel detail must not inherit grace from the focused diagnostic");
+            }
+
+            // No baseline credit for cleanup if the disabled assertion above fails.
+            d.harness.event(Event::PointerGone);
+            d.frames(3);
+            assert!(d.harness.state().ui_error.is_none());
+            assert_eq!(d.harness.ctx.memory(|memory| memory.focused()), Some(cancel));
+            assert!(!d.harness.ctx.read_response(cancel).unwrap().hovered());
+            assert!(!full_detail(&d, "Cancel"));
+            assert!(!full_detail(&d, &text));
+            assert_eq!(document_state(&mut d), before_document);
+            assert_eq!(job_state(&jobs), before_jobs);
+        }
+    }
 }

@@ -208,7 +208,7 @@ pub fn progress(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     egui::Tooltip::for_widget(&row_response).show(|ui| {
                         ui.add(egui::Label::new(row_text.as_str()).sense(Sense::hover()));
                     });
-                } else {
+                } else if app.session.prefs.general.show_tool_tips {
                     row_response.on_hover_text(row_text.as_str());
                 }
             } else {
